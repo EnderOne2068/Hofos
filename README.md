@@ -19,6 +19,6 @@ Hofos has two IRs: The forward-facing frontend IR, known as HANGMAN (or just Han
 ## Tools
 `cog` generates a BCPL header file containing global slots for your files. `nadb` processes `adb` (Absolute Debugger) commands to help debug code. Yacc does the obvious (note: this one is more difficult to recompile, as it is archaic 1985 source code; not Bison).
 ## Frontends
-haxMax is a frontend for Maxima (an implementation of the CAS language; embeds both SBCL and Hofos via libhofos and sbcl.o), hij is a Julia frontend, Histic is a C frontend (K&R) and Ofden is the D frontend.
+haxMax is a frontend for Maxima (an implementation of the CAS language; embeds both SBCL and Hofos via libhofos and sbcl.o), hij is a Julia frontend, Histic is a C frontend (K&R), cawk (Compiled AWK) is an AWK and Ofden is a D frontend.
 ## JIT
 If you examine `hofos-jit.b`, you will find a simple Just-In-Time compiler. This is not recommended for use, as it does not handle global state (falls back on a virtual machine for that) and cannot recompile at runtime for JIT performance.

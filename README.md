@@ -1,5 +1,5 @@
 # Hofos
-Hofos is a lightweight backend originally designed for BCPL that supports a wide range of targets and reliable targets.\
+Hofos is a lightweight backend originally designed for BCPL that supports a wide range of targets and a less wide but still wide range of self-hosting targets.\
 The support range includes PDP-10, PDP-11, VAX, IBM 7094 and various others.\
 Optimizations are slower than LLVM or GCC, but are still better than that of other lightweight backends such as QBE or Cranelift.\
 A fact was I used Claude Code (primarily the latest Opus models, but partially Fable) to generate the codebase, which was incredibly efficient.

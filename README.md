@@ -4,7 +4,7 @@ The support range includes PDP-10, PDP-11, VAX, IBM 7094 and various others.\
 Optimizations are slower than LLVM or GCC (reaching around 3.5x slower on microbenchmarks as the maximum), but are still better than that of other lightweight backends such as QBE or Cranelift.\
 A fact was I used Claude Code (primarily the latest Opus models, but partially Fable) to generate the codebase, which was incredibly efficient.
 ## Building
-To build Hofos, you must either have a working installation of the BCPL Cintcode System or use the bundled compiler in /build. It is recommended to regenerate a lot of the compiler artifacts, as they may be outdated or missing.\
+To build Hofos, you must either have a working installation of the BCPL Cintcode System or use the bundled compiler in /build. It is recommended to regenerate a lot of the compiler artifacts, as they may be outdated or missing.
 ## Source tree quirks
 `cg.b` is for x86, emitting an ELF directly. `cg-x86-linux` and `cg-x86-windows` use the newer assembler (`ac`) and linker (`fl`) to target differently - a newer innovation that is still in progress.\
 If you see a file starting with `hofos-` and ending with `.b`, then you can simply compile that. Examples include `ac`, `fl` and the various compiler drivers. 

@@ -1,0 +1,14 @@
+/* heap lists (getvec/freevec): return lists, runtime sizes, lists in loops */
+mk(n) := makelist(i * i, i, 1, n) $
+mk(5);                                             /* [1,4,9,16,25] returned from a fn (heap survives) */
+mk(3);                                             /* [1,4,9]  -- runtime size */
+mk(5)[4];                                          /* 16  -- index a returned list */
+dbl(n) := makelist(2 * i, i, 1, n) $
+dbl(4);                                            /* [2,4,6,8] */
+id2() := matrix([1, 0], [0, 1]) $
+id2();                                             /* matrix([1,0],[0,1]) returned from a fn */
+id2()[2][2];                                       /* 1 */
+grow() := block([s : 0], for k thru 4 do s : s + last(makelist(j, j, 1, k)), s) $
+grow();                                            /* last([1..k]) = k, sum 1..4 = 10; list built each iter on heap */
+fltvec(n) := makelist(1.0 * i, i, 1, n) $
+fltvec(3);                                         /* [1.0, 2.0, 3.0] float heap list from a fn */

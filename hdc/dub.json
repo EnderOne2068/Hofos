@@ -1,0 +1,15 @@
+{
+    "name": "hdc",
+    "description": "Hofos D Compiler — libdparse front end, Hofos (libhofos) back end.",
+    "authors": ["EnderOne2068"],
+    "license": "proprietary",
+    "dependencies": {
+        "libdparse": "~>0.25.1"
+    },
+    "targetType": "executable",
+    "targetName": "hdc",
+    "preBuildCommands": [
+        "objcopy -L _start -L main /mnt/c/Hofos/build/libhofos-native.o /dev/shm/libhofos-lib.o"
+    ],
+    "sourceFiles": ["/dev/shm/libhofos-lib.o"]
+}

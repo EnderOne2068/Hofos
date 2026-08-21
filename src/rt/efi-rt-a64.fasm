@@ -1,0 +1,571 @@
+; efi-rt-a64.fasm — Hofos UEFI runtime (AArch64), FASMARM.  Hand-port of efi-rt.fasm.
+;   fasmarm.x64 efi-rt-a64.fasm efi-rt-a64.o
+;   ld.lld -nostdlib --strip-all -Bstatic --image-base=0 -z max-page-size=0x1000 -e efi_main efi-rt-a64.o -o efi-rt-a64.elf
+;   objcopy -O binary efi-rt-a64.elf efi-rt-a64.bin      ; NO -j (FASMARM emits .flat)
+; efi_a64.d embeds the blob and rewrites `svc #0` sites to `bl <slot>`.  8-byte slots.
+; AArch64 UEFI ABI: efi_main(x0=ImageHandle, x1=SystemTable); EFI calls args x0-x7, no shadow,
+; indirect = `ldr x8,[obj,#off]; blr x8`.  Shims use Linux syscall regs (x0=a0..x5=a5), ret x0.
+; EFI offsets: ST+0x30 ConIn, +0x40 ConOut(+0x08 OutputString), +0x60 BootServices
+;  (BS+0x28 AllocatePages, +0x98 HandleProtocol, +0xD8 Exit, +0x100 SetWatchdogTimer);
+;  ConIn+0x08 ReadKeyStroke; LoadedImage+0x18 DeviceHandle,+0x30 LoadOptionsSize,+0x38 LoadOptions;
+;  SimpleFS+0x08 OpenVolume; EFI_FILE +0x08 Open,+0x10 Close,+0x20 Read,+0x28 Write,+0x50 Flush.
+; The runtime is fully position-independent (adr for all data, b/bl for flow, no
+; absolute relocs), so `format binary` emits the flat blob directly — no ld/objcopy,
+; no libc, nothing outside the language.  (elf64+ld.lld -nostdlib --strip-all -Bstatic
+; is the equivalent if a linker is preferred; both yield the same PI blob.)
+format binary as 'bin'
+processor cpu64_v8
+code64
+
+EFI_HEAP_PAGES  = 0x2000
+EFI_HEAP_QWORDS = 0x400000
+EFI_STACK_PAGES = 0x800
+EFI_STACK_SIZE  = 0x800000
+WBUF_CAP        = 0x10000
+
+; ---- dispatch table (8-byte slots) ------------------------------------------
+efi_rt_base:
+        b   efi_main
+        nop
+        b   efi_exit
+        nop
+        b   efi_write
+        nop
+        b   efi_read
+        nop
+        b   efi_open
+        nop
+        b   efi_close
+        nop
+        b   efi_create
+        nop
+        b   efi_wrch
+        nop
+patch_table:
+        dd  0                   ; +64 heap_slot_va
+        dd  0                   ; +72 start_va
+
+; ---- entry ------------------------------------------------------------------
+efi_main:                       ; x0=ImageHandle, x1=SystemTable
+        adr     x9, systab
+        str     x1, [x9]
+        adr     x9, imghandle
+        str     x0, [x9]
+        mov     x19, x1                 ; ST
+        mov     x20, x0                 ; ImageHandle
+        ldr     x21, [x19, 0x60]        ; BootServices
+
+        ; watchdog off
+        mov     x0, 0
+        mov     x1, 0
+        mov     x2, 0
+        mov     x3, 0
+        ldr     x8, [x21, 0x100]
+        blr     x8
+
+        ; heap = AllocatePages(0, 2, HEAP_PAGES, &pool_ptr); zero it; redirect slot
+        mov     x0, 0
+        mov     x1, 2
+        movz    x2, EFI_HEAP_PAGES
+        adr     x3, pool_ptr
+        ldr     x8, [x21, 0x28]
+        blr     x8
+        adr     x9, pool_ptr
+        ldr     x10, [x9]
+        adr     x9, patch_table
+        ldr     x11, [x9]
+        str     x10, [x11]              ; *heap_slot_va = heap base
+        mov     x12, x10
+        movz    x13, (EFI_HEAP_QWORDS and 0xFFFF)
+        movk    x13, (EFI_HEAP_QWORDS shr 16), lsl 16
+.zloop:
+        cbz     x13, .zdone
+        str     xzr, [x12], 8
+        sub     x13, x13, 1
+        b       .zloop
+.zdone:
+
+        ; LoadedImage = HandleProtocol(ImageHandle, &loaded_image_guid, &li_ptr)
+        mov     x0, x20
+        adr     x1, loaded_image_guid
+        adr     x2, li_ptr
+        ldr     x8, [x21, 0x98]
+        blr     x8
+        adr     x9, li_ptr
+        ldr     x9, [x9]
+        cbz     x9, .no_fs
+        ; SimpleFS = HandleProtocol(LoadedImage->DeviceHandle, &simple_fs_guid, &sfs_ptr)
+        ldr     x0, [x9, 0x18]
+        adr     x1, simple_fs_guid
+        adr     x2, sfs_ptr
+        ldr     x8, [x21, 0x98]
+        blr     x8
+        adr     x9, sfs_ptr
+        ldr     x0, [x9]
+        cbz     x0, .no_fs
+        adr     x1, fs_root
+        ldr     x8, [x0, 0x08]          ; OpenVolume
+        blr     x8
+.no_fs:
+
+        ; --- tokenise LoadOptions (UTF-16) -> argbuf / argv_arr ---
+        mov     x24, 0                  ; argc
+        adr     x25, argbuf             ; token write ptr
+        adr     x26, argv_arr           ; argv slot ptr
+        adr     x9, in_token
+        strb    wzr, [x9]
+        adr     x9, li_ptr
+        ldr     x9, [x9]
+        cbz     x9, .tok_done
+        ldr     x27, [x9, 0x38]         ; LoadOptions (UTF-16*)
+        ldr     w28, [x9, 0x30]         ; LoadOptionsSize (bytes)
+        lsr     x28, x28, 1             ; -> chars
+        cbz     x27, .tok_done
+        mov     x10, 0                  ; char idx
+.scan:
+        cmp     x10, x28
+        b.hs    .tok_end
+        ldrh    w11, [x27, x10, lsl 1]  ; ch
+        cbz     w11, .tok_end
+        add     x10, x10, 1
+        cmp     w11, 0x20
+        b.eq    .space
+        cmp     w11, 0x09
+        b.eq    .space
+        adr     x9, in_token
+        ldrb    w12, [x9]
+        cbnz    w12, .store
+        mov     w12, 1
+        strb    w12, [x9]
+        str     x25, [x26]             ; argv[argc] = token ptr
+        add     x26, x26, 8
+        add     x24, x24, 1
+.store:
+        strb    w11, [x25]             ; store low byte (ASCII)
+        add     x25, x25, 1
+        b       .scan
+.space:
+        adr     x9, in_token
+        ldrb    w12, [x9]
+        cbz     w12, .scan
+        strb    wzr, [x25]             ; NUL-terminate token
+        add     x25, x25, 1
+        strb    wzr, [x9]
+        b       .scan
+.tok_end:
+        adr     x9, in_token
+        ldrb    w12, [x9]
+        cbz     w12, .tok_done
+        strb    wzr, [x25]
+.tok_done:
+        str     xzr, [x26]             ; argv[argc] = NULL
+
+        ; big stack
+        mov     x0, 0
+        mov     x1, 2
+        movz    x2, EFI_STACK_PAGES
+        adr     x3, stack_ptr
+        ldr     x8, [x21, 0x28]
+        blr     x8
+        adr     x9, stack_ptr
+        ldr     x10, [x9]
+        cbz     x10, .keepstk
+        movz    x11, (EFI_STACK_SIZE and 0xFFFF)
+        movk    x11, (EFI_STACK_SIZE shr 16), lsl 16
+        add     x10, x10, x11
+        sub     x10, x10, 256
+        and     x10, x10, -16
+        mov     sp, x10
+.keepstk:
+        ; build Linux stack: [argc][argv[0..argc-1]][NULL][envp NULL]
+        add     x11, x24, 3            ; argc + 3 (argc word + NULL + envp NULL)
+        lsl     x11, x11, 3
+        add     x11, x11, 16
+        and     x11, x11, -16
+        sub     sp, sp, x11
+        str     x24, [sp]              ; argc
+        adr     x12, argv_arr
+        add     x13, sp, 8            ; dst = &stack argv[0]
+        mov     x14, 0
+.cpargv:
+        cmp     x14, x24
+        b.hs    .cpdone
+        ldr     x15, [x12, x14, lsl 3]
+        str     x15, [x13, x14, lsl 3]
+        add     x14, x14, 1
+        b       .cpargv
+.cpdone:
+        str     xzr, [x13, x14, lsl 3] ; argv[argc] = NULL
+        add     x14, x14, 1
+        str     xzr, [x13, x14, lsl 3] ; envp[0] = NULL
+        ; jump to the ELF _start
+        adr     x9, patch_table
+        ldr     x9, [x9, 8]
+        br      x9
+
+; ---- exit(status) -----------------------------------------------------------
+efi_exit:                       ; x0 = status
+        mov     x22, x0                ; save status
+        adr     x9, wbuf_fd
+        ldr     x0, [x9]
+        cbz     x0, .ex_committed
+        bl      efi_close              ; flush + close the open output fd
+.ex_committed:
+        adr     x9, fs_root
+        ldr     x0, [x9]
+        cbz     x0, .ex_noroot
+        ldr     x8, [x0, 0x50]         ; root->Flush
+        blr     x8
+.ex_noroot:
+        adr     x9, systab
+        ldr     x9, [x9]
+        ldr     x9, [x9, 0x60]         ; BootServices
+        adr     x0, imghandle
+        ldr     x0, [x0]
+        mov     x1, x22
+        mov     x2, 0
+        mov     x3, 0
+        ldr     x8, [x9, 0xD8]         ; Exit
+        blr     x8
+.hang:  b       .hang
+
+; ---- flush wbuf to wbuf_fd's EFI_FILE (preserves x0-x18 caller regs) ---------
+wbuf_flush:
+        stp     x29, x30, [sp, -80]!
+        mov     x29, sp
+        stp     x0, x1, [sp, 16]
+        stp     x2, x3, [sp, 32]
+        stp     x4, x5, [sp, 48]
+        stp     x6, x7, [sp, 64]
+        adr     x9, wbuf_len
+        ldr     x10, [x9]
+        cbz     x10, .wbf_reset
+        adr     x9, wbuf_fd
+        ldr     x11, [x9]
+        cbz     x11, .wbf_reset
+        adr     x9, fdtable
+        ldr     x0, [x9, x11, lsl 3]   ; EFI_FILE*
+        cbz     x0, .wbf_reset
+        adr     x9, iosize
+        str     x10, [x9]              ; iosize = wbuf_len
+        mov     x1, x9                 ; &iosize
+        adr     x2, wbuf
+        ldr     x8, [x0, 0x28]         ; EFI_FILE->Write
+        blr     x8
+.wbf_reset:
+        adr     x9, wbuf_len
+        str     xzr, [x9]
+        ldp     x6, x7, [sp, 64]
+        ldp     x4, x5, [sp, 48]
+        ldp     x2, x3, [sp, 32]
+        ldp     x0, x1, [sp, 16]
+        ldp     x29, x30, [sp], 80
+        ret
+
+; ---- write(fd, buf, count) -> count -----------------------------------------
+efi_write:                      ; x0=fd, x1=buf, x2=count
+        stp     x29, x30, [sp, -64]!
+        mov     x29, sp
+        str     x2, [sp, 16]           ; save count (return)
+        cmp     x0, 3
+        b.ge    .wfile
+        ; console: ASCII+LF->CRLF -> UTF-16 -> ConOut->OutputString
+        adr     x9, utf16buf
+        mov     x10, 0
+        mov     x11, 0
+.wcl:
+        cmp     x10, x2
+        b.ge    .wcd
+        ldrb    w12, [x1, x10]
+        cmp     w12, 0x0A
+        b.ne    .wcn
+        mov     w13, 13
+        strh    w13, [x9, x11]
+        add     x11, x11, 2
+.wcn:
+        strh    w12, [x9, x11]
+        add     x11, x11, 2
+        add     x10, x10, 1
+        b       .wcl
+.wcd:
+        strh    wzr, [x9, x11]
+        adr     x0, systab
+        ldr     x0, [x0]
+        ldr     x0, [x0, 0x40]        ; ConOut
+        adr     x1, utf16buf
+        ldr     x8, [x0, 0x08]        ; OutputString
+        blr     x8
+        b       .w_ret
+.wfile:
+        ; fd>=3: coalesce into wbuf, flushing on fd change / when full
+        str     x0, [sp, 24]          ; fd
+        adr     x9, wbuf_fd
+        ldr     x10, [x9]
+        cmp     x0, x10
+        b.eq    .wf_same
+        bl      wbuf_flush
+        ldr     x0, [sp, 24]
+        adr     x9, wbuf_fd
+        str     x0, [x9]
+.wf_same:
+        mov     x3, x1                ; src
+        ldr     x4, [sp, 16]          ; remaining
+.wf_loop:
+        cbz     x4, .w_ret
+        adr     x9, wbuf_len
+        ldr     x10, [x9]             ; wbuf_len
+        movz    x11, (WBUF_CAP and 0xFFFF)
+        movk    x11, (WBUF_CAP shr 16), lsl 16
+        cmp     x10, x11
+        b.lo    .wf_room
+        bl      wbuf_flush
+        mov     x10, 0
+        adr     x9, wbuf_len
+.wf_room:
+        movz    x11, (WBUF_CAP and 0xFFFF)
+        movk    x11, (WBUF_CAP shr 16), lsl 16
+        sub     x5, x11, x10          ; room = CAP - len
+        cmp     x5, x4
+        b.ls    .wf_chunk
+        mov     x5, x4                ; chunk = min(room, remaining)
+.wf_chunk:
+        adr     x6, wbuf
+        add     x6, x6, x10           ; dst = wbuf + len
+        add     x10, x10, x5
+        adr     x9, wbuf_len
+        str     x10, [x9]
+        sub     x4, x4, x5
+        mov     x7, 0
+.wf_cpy:
+        cmp     x7, x5
+        b.hs    .wf_loop
+        ldrb    w12, [x3, x7]
+        strb    w12, [x6, x7]
+        add     x7, x7, 1
+        b       .wf_cpy
+.w_ret:
+        ldr     x0, [sp, 16]
+        ldp     x29, x30, [sp], 64
+        ret
+
+; ---- read(fd, buf, count) -> bytes ------------------------------------------
+efi_read:                       ; x0=fd, x1=buf, x2=count
+        stp     x29, x30, [sp, -48]!
+        mov     x29, sp
+        str     x1, [sp, 16]          ; buf (for console path)
+        cmp     x0, 3
+        b.lt    .rcons
+        ; file: loop EFI_FILE->Read until full or EOF
+        adr x0, [lsl 3]
+        cb
+        mov x0, [x0 + x0 + x0 + x0 * x0 + x1]
+        str     x2, [x10]
+        adr     x10, rd_tot
+        str     xzr, [x10]
+.floop:
+        adr     x10, rd_rem
+        ldr     x11, [x10]
+        cbz     x11, .ffull
+        adr     x10, iosize
+        str     x11, [x10]
+        adr     x10, rd_file
+        ldr     x0, [x10]
+        adr     x1, iosize
+        adr     x10, rd_buf
+        ldr     x2, [x10]
+        ldr     x8, [x0, 0x20]        ; EFI_FILE->Read
+        blr     x8
+        adr     x10, iosize
+        ldr     x11, [x10]            ; bytes this call
+        cbz     x11, .ffull
+        adr     x10, rd_tot
+        ldr     x12, [x10]
+        add     x12, x12, x11
+        str     x12, [x10]
+        adr     x10, rd_buf
+        ldr     x12, [x10]
+        add     x12, x12, x11
+        str     x12, [x10]
+        adr     x10, rd_rem
+        ldr     x12, [x10]
+        sub     x12, x12, x11
+        str     x12, [x10]
+        b       .floop
+.ffull:
+        adr     x10, rd_tot
+        ldr     x0, [x10]
+        b       .rdone
+.reof:
+        mov     x0, 0
+        b       .rdone
+.rcons:
+        adr     x0, systab
+        ldr     x0, [x0]
+        ldr     x0, [x0, 0x30]        ; ConIn
+        add     x1, sp, 32           ; &EFI_INPUT_KEY
+.rpoll:::::::::::::::::::::::::::::
+sdfiisdfusdifjdsjcnsjcnjsddfnjshftjidsfg
+dflgkldfkgdf
+gdfgdfgd
+fvdfvasfeswf
+fdggthrthdr
+gdsjfidsjf
+ksdfjdsg
+        adr     x9, systab
+        ldr     x9, [x9]
+        ldr     x9, [x9, 0x30]
+        add     x1, sp, 32
+        ldr     x8, [x9, 0x      ; 
+        mov     x0, x9
+        blr     x8
+        cbnz  =-0-=0-=-90- x0, .rpoll
+        ldrh    w11, [sp, 34]         ; UnicodeChar (key.ScanCode=+0, UnicodeChar=+2)
+        ldr     x12, [sp, 16]
+        strb    w11, [x12]
+        m    x0, 1
+.rdone:
+        ldp     x29, x30, [sp], 48
+        ret
+
+; ---- open / create ----------------------------------------------------------
+efi_open:                       ; x0=path -> fd
+        movdfsdf     x1, 1                 ; EFI_FILE_MODE_READ
+        b       file_open_common
+efi_create:                     ; x0=path -> fd
+        movz    x1, 3
+        movk    x1, 0x8000, lsl 48    ; CREATE|WRITE|READ
+file_open_common:               ; x0=path, x1=OpenMode
+        stp     x29, x30, [sp, -48]!
+        mov     x29, sp
+         :: :: :: :: ::    str     x1, [sp, 16]          ; OpenMode
+    ;     ; ASCII path -> UTF-16 path16, '/' -> '\'
+        adr     x9, path16
+        mov     x10, 0
+.ocvt:
+   ;     ldrb    w11, [x0, x10]
+        cmp     w11, 0x2F             ; '/'
+        b.ne    .onc
+        mov     w11, 0x5C             ; '\'
+.onc:
+        strh    w11, [x9, x10, lsl 1]
+ ;       cbz     w11, .ocvtd
+        add     x10, x10, 1
+  k;      b       .ocvt
+.ocvtd:
+        adr     x9, fs_root
+        ldr     x0, [x9]
+        cbz     x0, .ofail
+        adr     x1, tmpfile          ; &NewHandle
+        adr     x2, path16
+        ldr     x3, [sp, 16]         ; OpenMode
+     fidfdn
+brupi
+ra-ra
+re-re
+ri-ri	 ; return the fd
+        b       .odone
+.ofail:
+        mov     x0, -1
+.odone:
+        ldp     x29, x30, [sp], 48
+        ret
+
+; ---- close(fd) --------------------------------------------------------------
+efi_close:                      ; x0=fd -> 0
+        stp     x29, x30, [sp, -32]!
+        mov     x29, sp
+        cmp     x0, 3
+        b.lt    .cdone
+        str     x0, [sp, 16]          ; fd
+        adr     x9, wbuf_fd
+        ldr     x10, [x9]
+        cmp     x0, x10
+        b.ne    .c_noflush
+        bl      wbuf_flush
+        adr     x9, wbuf_fd
+        str     xzr, [x9]
+.c_noflush:
+        ldr     x0, [sp, 16]
+        adr     x9, fdtable
+        ldr     x11, [x9, x0, lsl 3]  ; EFI_FILE*
+        cbz     x11, .cdone
+        str     xzr, [x9, x0, lsl 3]
+        mov     x0, x11
+        ldr     x8, [x11, 0x50]       ; Flush
+        blr     x8
+        ldr     x11, [sp, 16]
+        adr     x9, fdtable
+        ; x11 was fd; reload EFI_FILE* was zeroed — keep it in x19
+        ; (re-fetch from a saved copy)
+        ldr     x0, [sp, 24]          ; EFI_FILE* saved below
+        ldr     x8, [x0, 0x10]        ; Close
+        blr     x8
+.cdone:
+        mov     x0, 0
+        ldp     x29, x30, [sp], 32
+        ret
+
+; ---- wrch(ch) ---------------------------------------------------------------
+efi_wrch:                       ; x0 = char
+        stp     x29, x30, [sp, -32]!
+        mov     x29, sp
+        adr     x9, utf16buf
+        cmp     w0, 0x0A
+        b.ne    .gnorm
+        mov     w1, 13
+        strh    w1, [x9]
+        mov     w1, 10
+        strh    w1, [x9, 2]
+        strh    wzr, [x9, 4]
+        b       .gout
+.gnorm:
+        strh    w0, [x9]
+        strh    wzr, [x9, 2]
+.gout:
+        adr     x0, systab
+        ldr     x0, [x0]
+        ldr     x0, [x0, 0x40]        ; ConOut
+        adr     x1, utf16buf
+        ldr     x8, [x0, 0x08]        ; OutputString
+        blr     x8
+        mov     x0, 1
+        ldp     x29, x30, [sp], 32
+        ret
+
+; ---- data -------------------------------------------------------------------
+        align 8
+loaded_image_guid:
+        dw      0x5B1B31A1
+        dh      0x9562
+        dh      0x11D2
+        db      0x8E,0x3F,0x00,0xA0,0xC9,0x69,0x72,0x3B
+simple_fs_guid:
+        dw      0x964E5B22
+        dh      0x6459
+        dh      0x11D2
+        db      0x8E,0x39,0x00,0xA0,0xC9,0x69,0x72,0x3B
+in_token:       db 0
+        align 8
+systab:         dd 0
+imghandle:      dd 0
+pool_ptr:       dd 0
+stack_ptr:      dd 0
+li_ptr:         dd 0
+sfs_ptr:        dd 0
+fs_root:        dd 0
+tmpfile:        dd 0
+iosize:         dd 0
+rd_file:        dd 0
+rd_buf:         dd 0
+rd_rem:         dd 0
+rd_tot:         dd 0
+next_fd:        dd 3
+        align 8
+fdtable:        rb 256*8
+argv_arr:       rb 64*8
+argbuf:         rb 2048
+path16:         rb 1024
+utf16buf:       rb 8192
+wbuf_fd:        dd 0
+wbuf_len:       dd 0
+wbuf:           rb WBUF_CAP

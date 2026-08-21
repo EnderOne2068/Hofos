@@ -1,0 +1,594 @@
+; efi-rt.fasm — Hofos UEFI runtime stub (x86-64), assembled flat with FASM.
+; The WHOLE EFI runtime: efi.d places this blob and rewrites the program's Linux
+; syscall sites to call its dispatch slots.  No hand-encoded machine code in D.
+;
+; All I/O shims use Linux syscall register semantics (rdi=arg0, rsi=arg1,
+; rdx=arg2, ...), so a rewritten site just needs `call <slot>`.
+;
+; Fixed dispatch offsets efi.d relies on:
+;   +0  efi_main    PE entry (rcx=ImageHandle, rdx=SystemTable)
+;   +8  efi_exit    (rax=status) -> BootServices->Exit
+;   +16 efi_write   write(rdi=fd, rsi=buf, rdx=count)  fd<3 ConOut else file
+;   +24 efi_read    read (rdi=fd, rsi=buf, rdx=count)  fd<3 ConIn  else file
+;   +32 efi_open    open (rdi=path)            -> fd  (O_RDONLY)
+;   +40 efi_close   close(rdi=fd)
+;   +48 efi_create  open (rdi=path) for write  -> fd  (CREATE|WRITE)
+;   +56 efi_wrch    putchar(dil) to ConOut  (1-byte console fast path)
+;   +64 patch_table (heap_slot_va, start_va)
+
+use64
+org 0
+
+dispatch:
+        jmp     efi_main
+        db      (8-($-dispatch)) dup (0x90)
+        jmp     efi_exit
+        db      (16-($-dispatch)) dup (0x90)
+        jmp     efi_write
+        db      (24-($-dispatch)) dup (0x90)
+        jmp     efi_read
+        db      (32-($-dispatch)) dup (0x90)
+        jmp     efi_open
+        db      (40-($-dispatch)) dup (0x90)
+        jmp     efi_close
+        db      (48-($-dispatch)) dup (0x90)
+        jmp     efi_create
+        db      (56-($-dispatch)) dup (0x90)
+        jmp     efi_wrch
+        db      (64-($-dispatch)) dup (0x90)
+
+patch_table:
+heap_slot_va:   dq 0
+start_va:       dq 0
+
+EFI_HEAP_SIZE  = 0x2000000                   ; 32 MB — the compiler's fixed arenas
+EFI_HEAP_PAGES = EFI_HEAP_SIZE / 0x1000      ; total ~17 MB; fits in default 128 MB
+EFI_STACK_SIZE  = 0x800000                   ; 8 MB stack (matches Linux default);
+EFI_STACK_PAGES = EFI_STACK_SIZE / 0x1000    ; the firmware stack overflows the parser
+
+; ---- entry ----------------------------------------------------------------
+efi_main:                       ; rcx=ImageHandle, rdx=SystemTable
+        mov     [systab], rdx
+        mov     [imghandle], rcx
+        mov     rbx, rdx                ; rbx=ST (nonvolatile)
+        mov     rsi, rcx                ; rsi=ImageHandle
+
+        ; watchdog off
+        mov     rcx, [rbx+0x60]
+        mov     rax, [rcx+0x100]
+        xor     ecx, ecx
+        xor     edx, edx
+        xor     r8d, r8d
+        xor     r9d, r9d
+        sub     rsp, 0x20
+        call    rax
+        add     rsp, 0x20
+
+        ; AllocatePages heap + redirect bump slot.  (AllocatePages takes whole
+        ; pages from free conventional memory, so a 64 MB heap succeeds on the
+        ; default 128 MB — unlike AllocatePool, whose pool region is small.)
+        ; AllocatePages(AllocateAnyPages=0, EfiLoaderData=2, Pages, &Memory).
+        mov     rcx, [rbx+0x60]
+        mov     rax, [rcx+0x28]         ; BootServices->AllocatePages
+        xor     ecx, ecx                ; AllocateAnyPages
+        mov     edx, 2                  ; EfiLoaderData
+        mov     r8d, EFI_HEAP_PAGES
+        lea     r9, [pool_ptr]          ; &Memory (out)
+        sub     rsp, 0x20
+        call    rax
+        add     rsp, 0x20
+        test    rax, rax
+        jnz     .no_heap
+        mov     rax, [pool_ptr]
+        mov     rcx, [heap_slot_va]
+        mov     [rcx], rax
+        ; Zero the heap.  AllocatePages returns UNINITIALISED memory, but the
+        ; compiler relies on getvec storage being zero like the Linux .bss heap;
+        ; uninitialised reads otherwise diverged (dropped 44 funcs under EFI).
+        mov     rdi, [pool_ptr]
+        mov     rcx, EFI_HEAP_SIZE / 8
+        xor     eax, eax
+        cld
+        rep     stosq
+.no_heap:
+
+        ; LoadedImage
+        mov     rcx, rsi
+        lea     rdx, [loaded_image_guid]
+        lea     r8,  [li_ptr]
+        mov     rax, [rbx+0x60]
+        mov     rax, [rax+0x98]
+        sub     rsp, 0x20
+        call    rax
+        add     rsp, 0x20
+
+        ; --- filesystem root: SimpleFS on DeviceHandle, then OpenVolume ---
+        mov     rdi, [li_ptr]
+        test    rdi, rdi
+        jz      .no_fs
+        mov     rcx, [rdi+0x18]         ; LoadedImage->DeviceHandle
+        lea     rdx, [simple_fs_guid]
+        lea     r8,  [sfs_ptr]
+        mov     rax, [rbx+0x60]
+        mov     rax, [rax+0x98]         ; HandleProtocol
+        sub     rsp, 0x20
+        call    rax
+        add     rsp, 0x20
+        test    rax, rax
+        jnz     .no_fs
+        mov     rcx, [sfs_ptr]
+        lea     rdx, [fs_root]
+        mov     rax, [rcx+0x08]         ; SimpleFS->OpenVolume
+        sub     rsp, 0x20
+        call    rax
+        add     rsp, 0x20
+.no_fs:
+
+        ; --- tokenise LoadOptions (UTF-16) -> argbuf/argv_arr ---
+        mov     rdi, [li_ptr]
+        xor     ebp, ebp
+        lea     r14, [argbuf]
+        lea     r15, [argv_arr]
+        mov     byte [in_token], 0
+        test    rdi, rdi
+        jz      .tok_done
+        mov     r12, [rdi+0x38]
+        mov     r13d, [rdi+0x30]
+        shr     r13, 1
+        test    r12, r12
+        jz      .tok_done
+        xor     r10d, r10d
+.scan:
+        cmp     r10, r13
+        jae     .tok_end
+        movzx   eax, word [r12 + r10*2]
+        test    ax, ax
+        jz      .tok_end
+        inc     r10
+        cmp     ax, 0x20
+        je      .space
+        cmp     ax, 0x09
+        je      .space
+        cmp     byte [in_token], 0
+        jne     .store
+        mov     byte [in_token], 1
+        mov     [r15], r14
+        add     r15, 8
+        inc     ebp
+.store:
+        mov     [r14], al
+        inc     r14
+        jmp     .scan
+.space:
+        cmp     byte [in_token], 0
+        je      .scan
+        mov     byte [r14], 0
+        inc     r14
+        mov     byte [in_token], 0
+        jmp     .scan
+.tok_end:
+        cmp     byte [in_token], 0
+        je      .tok_done
+        mov     byte [r14], 0
+.tok_done:
+        mov     qword [r15], 0
+
+        ; --- switch to a big stack before entering the program: the firmware
+        ; stack is small, and the compiler's recursive-descent parser (+ VEC
+        ; locals) overflows it, silently truncating the parse (smaller IR ->
+        ; ~44 dropped funcs).  rbx still = ST here (nonvolatile). ---
+        mov     rcx, [rbx+0x60]
+        mov     rax, [rcx+0x28]         ; AllocatePages
+        xor     ecx, ecx                ; AllocateAnyPages
+        mov     edx, 2                  ; EfiLoaderData
+        mov     r8d, EFI_STACK_PAGES
+        lea     r9, [stack_ptr]
+        sub     rsp, 0x20
+        call    rax
+        add     rsp, 0x20
+        mov     rax, [stack_ptr]
+        test    rax, rax
+        jz      .keepstk                ; alloc failed -> keep firmware stack
+        add     rax, EFI_STACK_SIZE - 256
+        and     rax, -16
+        mov     rsp, rax                ; switch to the new stack top
+.keepstk:
+
+        ; --- build Linux stack [argc][argv..][NULL][envp NULL] ---
+        and     rsp, -16
+        lea     rax, [rbp+3]
+        shl     rax, 3
+        add     rax, 24
+        and     rax, -16
+        sub     rsp, rax
+        mov     [rsp], rbp
+        lea     rsi, [argv_arr]
+        lea     rdi, [rsp+8]
+        lea     rcx, [rbp+1]
+        cld                             ; UEFI doesn't guarantee DF clear; rep must go forward
+        rep     movsq
+        mov     qword [rdi], 0
+
+        mov     rax, [start_va]
+        jmp     rax
+
+; ---- clean exit -----------------------------------------------------------
+efi_exit:                               ; rax = status
+        ; Commit + close any output left open: the program may exit without
+        ; calling endwrite (on Linux, process exit flushes fds; UEFI has no such
+        ; thing), which would strand the final partial write buffer.
+        push    rax                     ; save exit status
+        mov     rdi, [wbuf_fd]
+        test    rdi, rdi
+        jz      .ex_committed
+        call    efi_close               ; wbuf_flush + EFI_FILE.Flush + Close
+.ex_committed:
+        ; Flush the volume root too, so the FAT + directory entries reach the
+        ; block device before reset (a per-file Flush did not commit the final
+        ; chunk on a real image — only complete on the next mount otherwise).
+        mov     rcx, [fs_root]
+        test    rcx, rcx
+        jz      .ex_noroot
+        sub     rsp, 0x20               ; shadow (rsp 16-aligned here)
+        mov     rax, [rcx+0x50]         ; EFI_FILE->Flush on the root dir
+        call    rax
+        add     rsp, 0x20
+.ex_noroot:
+        pop     rax
+        mov     rdx, rax
+        and     rsp, -16
+        mov     rcx, [imghandle]
+        xor     r8d, r8d
+        xor     r9d, r9d
+        mov     rax, [systab]
+        mov     rax, [rax+0x60]
+        mov     rax, [rax+0xD8]
+        sub     rsp, 0x20
+        call    rax
+.hang:  jmp     .hang
+
+; ---- flush the file-output buffer -----------------------------------------
+; Writes wbuf[0..wbuf_len) to wbuf_fd's EFI_FILE, then resets wbuf_len.
+; Preserves every register except rax, so efi_write can call it inside its
+; copy loop without saving its working registers.
+wbuf_flush:
+        push    rbp
+        mov     rbp, rsp
+        push    rcx
+        push    rdx
+        push    rsi
+        push    rdi
+        push    r8
+        push    r9
+        push    r10
+        push    r11                     ; 8 pushes -> 16-aligned
+        sub     rsp, 0x20               ; shadow space
+        mov     rax, [wbuf_len]
+        test    rax, rax
+        jz      .wbf_reset
+        mov     rcx, [wbuf_fd]
+        test    rcx, rcx
+        jz      .wbf_reset
+        lea     r10, [fdtable]
+        mov     rcx, [r10+rcx*8]        ; EFI_FILE*
+        test    rcx, rcx
+        jz      .wbf_reset
+        mov     rax, [wbuf_len]
+        mov     [iosize], rax
+        lea     rdx, [iosize]
+        lea     r8,  [wbuf]
+        mov     rax, [rcx+0x28]         ; EFI_FILE->Write
+        call    rax
+.wbf_reset:
+        xor     eax, eax
+        mov     [wbuf_len], rax
+        add     rsp, 0x20
+        pop     r11
+        pop     r10
+        pop     r9
+        pop     r8
+        pop     rdi
+        pop     rsi
+        pop     rdx
+        pop     rcx
+        pop     rbp
+        ret
+
+; ---- write(fd, buf, count) ------------------------------------------------
+efi_write:                              ; rdi=fd, rsi=buf, rdx=count -> rax
+        push    rbp
+        mov     rbp, rsp
+        sub     rsp, 0x40
+        mov     [rbp-8],  rdi
+        mov     [rbp-16], rsi
+        mov     [rbp-24], rdx
+        cmp     rdi, 3
+        jge     .wfile
+        ; console: ASCII -> UTF-16 -> ConOut->OutputString
+        lea     r9, [utf16buf]
+        mov     rsi, [rbp-16]
+        mov     r8,  [rbp-24]
+        xor     r10, r10
+        xor     r11, r11
+.wcl:
+        cmp     r10, r8
+        jge     .wcd
+        movzx   eax, byte [rsi+r10]
+        cmp     al, 0x0A
+        jne     .wcn
+        mov     word [r9+r11], 13
+        add     r11, 2
+.wcn:
+        mov     word [r9+r11], ax
+        add     r11, 2
+        inc     r10
+        jmp     .wcl
+.wcd:
+        mov     word [r9+r11], 0
+        mov     rax, [systab]
+        mov     rcx, [rax+0x40]         ; ConOut
+        mov     rax, [rcx+0x08]         ; OutputString
+        lea     rdx, [utf16buf]
+        call    rax
+        mov     rax, [rbp-24]
+        jmp     .wdone
+.wfile:
+        ; fd >= 3: coalesce into wbuf.  Flush first if the target fd changed.
+        mov     rax, [rbp-8]            ; fd
+        cmp     rax, [wbuf_fd]
+        je      .wf_same
+        call    wbuf_flush
+        mov     rax, [rbp-8]
+        mov     [wbuf_fd], rax
+.wf_same:
+        mov     rsi, [rbp-16]          ; src
+        mov     rdx, [rbp-24]          ; bytes remaining
+.wf_loop:
+        test    rdx, rdx
+        jz      .wf_ret
+        mov     rax, [wbuf_len]
+        cmp     rax, WBUF_CAP
+        jb      .wf_room
+        call    wbuf_flush             ; buffer full (rsi/rdx preserved)
+        xor     eax, eax               ; wbuf_len is now 0
+.wf_room:
+        mov     rcx, WBUF_CAP
+        sub     rcx, rax               ; room = CAP - wbuf_len
+        cmp     rcx, rdx
+        jbe     .wf_chunk
+        mov     rcx, rdx               ; chunk = min(room, remaining)
+.wf_chunk:
+        lea     rdi, [wbuf]
+        add     rdi, [wbuf_len]
+        add     [wbuf_len], rcx
+        sub     rdx, rcx
+        cld
+        rep     movsb                  ; rsi/rdi advance, rcx -> 0
+        jmp     .wf_loop
+.wf_ret:
+        mov     rax, [rbp-24]          ; report the full count written
+        jmp     .wdone
+.wfail:
+        xor     rax, rax
+.wdone:
+        add     rsp, 0x40
+        pop     rbp
+        ret
+
+; ---- read(fd, buf, count) -------------------------------------------------
+efi_read:                               ; rdi=fd, rsi=buf, rdx=count -> rax
+        push    rbp
+        mov     rbp, rsp
+        sub     rsp, 0x40
+        mov     [rbp-8], rsi            ; buf
+        cmp     rdi, 3
+        jl      .rcons
+        ; file: LOOP EFI_FILE->Read until the full count is read or true EOF.
+        ; EFI may return fewer bytes than requested mid-file; without this loop a
+        ; short read looks like EOF to the runtime's buffered rdch, which silently
+        ; truncated large GET-includes (dropped ~44 funcs from the self-host).
+        lea     r10, [fdtable]
+        mov     r10, [r10+rdi*8]
+        test    r10, r10
+        jz      .reof
+        mov     [rd_file], r10
+        mov     [rd_buf], rsi
+        mov     [rd_rem], rdx
+        xor     eax, eax
+        mov     [rd_tot], rax
+.floop:
+        mov     rax, [rd_rem]
+        test    rax, rax
+        jz      .ffull
+        mov     [iosize], rax           ; request the remaining bytes
+        mov     rcx, [rd_file]
+        lea     rdx, [iosize]
+        mov     r8,  [rd_buf]
+        mov     rax, [rcx+0x20]         ; EFI_FILE->Read
+        call    rax
+        mov     rax, [iosize]           ; bytes this call
+        test    rax, rax
+        jz      .ffull                  ; 0 -> EOF
+        add     [rd_tot], rax
+        add     [rd_buf], rax
+        sub     [rd_rem], rax
+        jmp     .floop
+.ffull:
+        mov     rax, [rd_tot]
+        jmp     .rdone
+.reof:
+        xor     rax, rax
+        jmp     .rdone
+.rcons:
+.rpoll:
+        mov     rax, [systab]
+        mov     rcx, [rax+0x30]         ; ConIn
+        mov     rax, [rcx+0x08]         ; ReadKeyStroke
+        lea     rdx, [rbp-16]
+        call    rax
+        test    rax, rax
+        jnz     .rpoll
+        movzx   eax, word [rbp-14]      ; UnicodeChar
+        mov     rcx, [rbp-8]
+        mov     [rcx], al
+        mov     eax, 1
+.rdone:
+        add     rsp, 0x40
+        pop     rbp
+        ret
+
+; ---- open / create --------------------------------------------------------
+efi_open:                               ; rdi=path -> rax=fd or -1
+        mov     r9, 1                   ; EFI_FILE_MODE_READ
+        jmp     file_open_common
+efi_create:                             ; rdi=path -> rax=fd or -1
+        mov     r9, 0x8000000000000003  ; CREATE | WRITE | READ
+
+file_open_common:                       ; rdi=path, r9=OpenMode
+        push    rbp
+        mov     rbp, rsp
+        sub     rsp, 0x40
+        mov     [rbp-8], r9             ; save OpenMode
+        ; ASCII path -> UTF-16 path16, '/' -> '\'
+        lea     r8, [path16]
+        xor     rcx, rcx
+.ocvt:
+        movzx   eax, byte [rdi+rcx]
+        cmp     al, '/'
+        jne     .onc
+        mov     al, '\'
+.onc:
+        mov     [r8+rcx*2], ax
+        test    al, al
+        jz      .ocvtd
+        inc     rcx
+        jmp     .ocvt
+.ocvtd:
+        mov     rcx, [fs_root]
+        test    rcx, rcx
+        jz      .ofail
+        lea     rdx, [tmpfile]
+        lea     r8,  [path16]
+        mov     r9,  [rbp-8]            ; OpenMode
+        mov     qword [rsp+0x20], 0     ; Attributes (5th arg)
+        mov     rax, [rcx+0x08]         ; EFI_FILE->Open (root)
+        call    rax
+        test    rax, rax
+        jnz     .ofail
+        mov     rax, [next_fd]
+        lea     r10, [fdtable]
+        mov     rcx, [tmpfile]
+        mov     [r10+rax*8], rcx
+        inc     qword [next_fd]
+        jmp     .odone
+.ofail:
+        mov     rax, -1
+.odone:
+        add     rsp, 0x40
+        pop     rbp
+        ret
+
+; ---- close(fd) ------------------------------------------------------------
+efi_close:                              ; rdi=fd -> rax=0
+        cmp     rdi, 3
+        jl      .cdone
+        push    rbp
+        mov     rbp, rsp
+        sub     rsp, 0x30               ; 0x20 shadow + room for [rbp-8] above it
+        ; commit any buffered output for this fd (table entry still valid)
+        cmp     rdi, [wbuf_fd]
+        jne     .c_noflush
+        call    wbuf_flush              ; preserves rdi
+        mov     qword [wbuf_fd], 0
+.c_noflush:
+        lea     r10, [fdtable]
+        mov     rcx, [r10+rdi*8]
+        test    rcx, rcx
+        jz      .cleave
+        mov     qword [r10+rdi*8], 0
+        mov     [rbp-8], rcx            ; save EFI_FILE* across the Flush call
+        ; Flush data+metadata to the block device first.  Close alone left the
+        ; output at 0 bytes on a real FAT image — the driver's write-back cache
+        ; was not committed before reset.  (Flush on a read fd is a harmless
+        ; ACCESS_DENIED; the status is ignored.)
+        mov     rax, [rcx+0x50]         ; EFI_FILE->Flush (0x18 is Delete!)
+        call    rax
+        mov     rcx, [rbp-8]
+        mov     rax, [rcx+0x10]         ; EFI_FILE->Close
+        call    rax
+.cleave:
+        add     rsp, 0x30
+        pop     rbp
+.cdone:
+        xor     rax, rax
+        ret
+
+; ---- wrch(dil) : one char to ConOut (newline -> CR LF) --------------------
+efi_wrch:                               ; dil = char
+        push    rbp
+        mov     rbp, rsp
+        sub     rsp, 0x20
+        movzx   eax, dil
+        lea     r9, [utf16buf]
+        cmp     al, 0x0A
+        jne     .gnorm
+        mov     word [r9],   13         ; CR
+        mov     word [r9+2], 10         ; LF
+        mov     word [r9+4], 0
+        jmp     .gout
+.gnorm:
+        mov     word [r9],   ax
+        mov     word [r9+2], 0
+.gout:
+        mov     rax, [systab]
+        mov     rcx, [rax+0x40]         ; ConOut
+        mov     rax, [rcx+0x08]         ; OutputString
+        lea     rdx, [utf16buf]
+        call    rax
+        add     rsp, 0x20
+        pop     rbp
+        mov     eax, 1
+        ret
+
+; ---- data -----------------------------------------------------------------
+align 8
+loaded_image_guid:
+        dd      0x5B1B31A1
+        dw      0x9562
+        dw      0x11D2
+        db      0x8E,0x3F,0x00,0xA0,0xC9,0x69,0x72,0x3B
+simple_fs_guid:
+        dd      0x0964E5B22
+        dw      0x6459
+        dw      0x11D2
+        db      0x8E,0x39,0x00,0xA0,0xC9,0x69,0x72,0x3B
+in_token:       db 0
+align 8
+systab:         dq 0
+imghandle:      dq 0
+pool_ptr:       dq 0
+stack_ptr:      dq 0
+li_ptr:         dq 0
+sfs_ptr:        dq 0
+fs_root:        dq 0
+tmpfile:        dq 0
+iosize:         dq 0
+rd_file:        dq 0
+rd_buf:         dq 0
+rd_rem:         dq 0
+rd_tot:         dq 0
+next_fd:        dq 3
+fdtable:        dq 256 dup (0)
+argv_arr:       dq 64 dup (0)
+argbuf:         db 2048 dup (0)
+path16:         db 1024 dup (0)
+utf16buf:       db 8192 dup (0)
+; File-output buffer: binwrch writes one byte per shost_write, so the compiler
+; emits its ~270 KB ELF as ~270 000 single-byte EFI_FILE.Write calls.  That is
+; ruinously slow AND a real FAT driver never commits the directory entry after
+; so many 1-byte appends (qemu's synthetic fat: masks it).  Coalesce file
+; writes here and flush in big chunks (and on close).
+WBUF_CAP        = 0x10000                ; 64 KiB
+wbuf_fd:        dq 0                     ; fd currently buffered (0 = none)
+wbuf_len:       dq 0                     ; valid bytes in wbuf
+wbuf:           db WBUF_CAP dup (0)

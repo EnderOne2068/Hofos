@@ -1,0 +1,17 @@
+/* --- lists / matrices lowered to HANGMAN (stack arrays) --- */
+[10, 20, 30];
+l : [3, 5, 7] $
+l[2];
+length(l);
+first(l);
+last(l);
+[1.5, 2.5, 3.0];
+makelist(i^2, i, 1, 5);
+sumf() := block([v : [10, 20, 30, 40], s : 0], for i thru length(v) do s : s + v[i], s) $
+sumf();
+idx3() := block([v : [7, 8, 9]], v[1] + v[2] + v[3]) $
+idx3();
+matrix([1, 2], [3, 4]);
+m : matrix([1, 2, 3], [4, 5, 6]) $
+m[2, 1];
+m[1][3];

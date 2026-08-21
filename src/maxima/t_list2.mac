@@ -1,0 +1,12 @@
+/* list/matrix PARAMETERS + algorithms, all compiled to HANGMAN */
+dot(a, b) := block([s : 0], for i thru length(a) do s : s + a[i] * b[i], s) $
+dot([1, 2, 3], [4, 5, 6]);                         /* 32 */
+tr(m, n) := block([s : 0], for i thru n do s : s + m[i, i], s) $
+tr(matrix([1, 2, 3], [4, 5, 6], [7, 8, 9]), 3);    /* 15 */
+fdot(a, b) := block([s : 0.0], for i thru length(a) do s : s + a[i] * b[i], s) $
+fdot([1.5, 2.0], [2.0, 3.0]);                      /* 9.0 */
+/* regression: numeric/symbolic paths still fine */
+fib(n) := if n < 2 then n else fib(n - 1) + fib(n - 2) $
+fib(20);                                            /* 6765 */
+diff(x^4, x);                                       /* 4*x^3 */
+factor(60);                                         /* 2^2*3*5 */

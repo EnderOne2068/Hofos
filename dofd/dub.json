@@ -1,0 +1,1 @@
+{ "name": "dofd", "dependencies": { "libdparse": "~>0.23.0" } }
